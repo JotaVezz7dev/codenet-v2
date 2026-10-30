@@ -1,5 +1,7 @@
 'use client'
 
+import { GoogleGenerativeAI, SchemaType, type FunctionDeclaration } from '@google/generative-ai'
+
 import { useState, useEffect, useRef, useId, memo } from 'react'
 import { 
   Activity, ArrowUp, Copy, ThumbsUp, ThumbsDown, BarChart2, Bell, CheckCircle2, ChevronDown, ChevronRight, 
@@ -12,6 +14,227 @@ import {
 } from 'lucide-react'
 
 // Ícone personalizado do Assistente
+// Chave pública no bundle estático, conforme a configuração deste projeto.
+const GEMINI_API_KEY = 'COLE_SUA_CHAVE_GEMINI_AQUI'
+
+const baseSystemInstruction = `
+Você é o Zseven (Zseven AI / Z7), o assistente virtual inteligente oficial do sistema Code Net, desenvolvido e pertencente exclusivamente à Zseven Systems.
+
+COMO VOCÊ FUNCIONA E RESPONDE:
+- Você conversa em linguagem natural, fluida, direta e prestativa.
+- NUNCA escreva blocos de código JSON (como {"action": ...}) dentro do texto da sua resposta. Quando precisar abrir uma tela, iniciar automação ou configurar o Wi-Fi, acione apenas a ferramenta (Function Calling) correspondente.
+- Se o usuário fizer perguntas fora do universo do Code Net, redes, telecomunicações ou tecnologia, recuse de forma curta, natural e amigável dizendo que não consegue ajudar com esse assunto por aqui, pois este chat é voltado exclusivamente ao sistema Code Net e redes da Zseven Systems.
+- Quando o usuário perguntar sobre o sistema Code Net ou como você funciona, explique de forma clara todos os módulos do sistema (Painel do Assistente com automação ZTE, Rede Local Dual-Band 2.4GHz/5GHz, Gerência e Diagnóstico TR-069/Firmware, Visão Geral Executiva, Monitoramento, Alertas e Usuários) e como você auxilia na operação.
+
+TELAS DISPONÍVEIS NO CODE NET:
+- Perfil Usuário ('user'): 'internet' (Painel do Assistente / Automação), 'local' (Rede Local / Wi-Fi 2.4GHz e 5GHz), 'diagnostics' (Gerência e Diagnóstico: abas accounts, tr069, software, config), 'premium' (Plano PREMIUM), 'settings' (Configurações).
+- Perfil Administrador ('admin'): 'overview' (Visão Geral Executiva), 'diagnostics' (Status Geral de Contratos), 'automations' (Resumo do Sistema), 'equipments' (Equipamentos), 'users' (Usuários e Permissões), 'security' (Segurança), 'monitoring' (Monitoramento), 'auditing' (Auditoria e Logs), 'alerts' (Alertas Operacionais), 'reports' (Relatórios), 'settings' (Configurações).
+`
+
+const functionDeclarations: FunctionDeclaration[] = [
+  {
+    name: 'navigate_to_screen',
+    description: 'Abre ou navega automaticamente para uma tela ou aba específica dentro do sistema Code Net.',
+    parameters: {
+      type: SchemaType.OBJECT,
+      properties: {
+        screen: {
+          type: SchemaType.STRING,
+          description: 'ID da tela: "internet", "local", "diagnostics", "overview", "automations", "equipments", "users", "security", "monitoring", "auditing", "alerts", "reports", "settings", "premium"'
+        },
+        diagnostic_tab: {
+          type: SchemaType.STRING,
+          description: 'Opcional. Se screen for "diagnostics", qual sub-aba abrir: "accounts", "tr069", "software" ou "config".'
+        }
+      },
+      required: ['screen']
+    }
+  },
+  {
+    name: 'start_router_automation',
+    description: 'Inicia imediatamente a automação completa do roteador ZTE F6600P no Painel do Assistente.',
+    parameters: {
+      type: SchemaType.OBJECT,
+      properties: {
+        target_ip: {
+          type: SchemaType.STRING,
+          description: 'IP do roteador alvo (padrão 192.168.1.1)'
+        }
+      }
+    }
+  },
+  {
+    name: 'update_wifi_config',
+    description: 'Preenche ou atualiza automaticamente as configurações de Wi-Fi 2.4GHz ou 5GHz na Rede Local quando o usuário pedir no chat.',
+    parameters: {
+      type: SchemaType.OBJECT,
+      properties: {
+        band: {
+          type: SchemaType.STRING,
+          description: '"2.4" para rede 2.4GHz ou "5" para rede 5GHz'
+        },
+        ssid_name: {
+          type: SchemaType.STRING,
+          description: 'Novo nome da rede Wi-Fi (SSID)'
+        },
+        crypto: {
+          type: SchemaType.STRING,
+          description: 'Criptografia: "WPA2-PSK-AES", "WPA3-SAE" ou "WPA/WPA2-PSK-Mixed"'
+        }
+      },
+      required: ['band']
+    }
+  }
+]
+
+// Cache de modelos em memória para não consultar a lista a cada mensagem
+let cachedCandidateModels: string[] | null = null
+
+async function getCandidateModels(signal: AbortSignal): Promise<string[]> {
+  if (cachedCandidateModels && cachedCandidateModels.length > 0) {
+    return cachedCandidateModels
+  }
+
+  // Ordem de prioridade: modelos estáveis primeiro (evita erro 503 de modelos preview)
+  const priorityOrder = [
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-3-flash-preview',
+    'gemini-2.5-pro',
+    'gemini-2.0-flash-lite'
+  ]
+
+  try {
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models', { headers: { 'x-goog-api-key': GEMINI_API_KEY }, signal })
+    if (!res.ok) return priorityOrder
+    const data = await res.json()
+    const available: string[] = (data.models || [])
+      .filter((m: any) => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
+      .map((m: any) => String(m.name).replace('models/', ''))
+
+    const ordered = priorityOrder.filter(m => available.includes(m))
+    const others = available.filter(m => m.startsWith('gemini') && !ordered.includes(m) && !m.includes('tts') && !m.includes('image'))
+    const finalModels = [...ordered, ...others]
+
+    if (finalModels.length > 0) {
+      cachedCandidateModels = finalModels
+      return finalModels
+    }
+  } catch (error) {
+    if (signal.aborted) throw error
+    // Se falhar a listagem, usa a lista padrão de prioridade
+  }
+
+  return priorityOrder
+}
+
+// Remove blocos JSON acidentais caso algum modelo escreva JSON no meio do texto
+function cleanRawJsonFromText(rawText: string): string {
+  return rawText
+    .replace(/```json[\s\S]*?```/gi, '')
+    .replace(/\{\s*"action"\s*:[\s\S]*?\}\s*\}/g, '')
+    .trim()
+}
+
+async function requestGeminiChat(message: string, history: { role: string; parts: { text: string }[] }[], systemContext: unknown, signal: AbortSignal): Promise<{ text: string; action: string | null; actionArgs?: Record<string, unknown> }> {
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+    const genAI = new GoogleGenerativeAI(GEMINI_API_KEY)
+
+    const dynamicContext = systemContext
+      ? `\n\nDADOS ATUAIS DO SISTEMA EM TEMPO REAL:\n${JSON.stringify(systemContext, null, 2)}`
+      : ''
+
+    // Limpa mensagens de erro antigas e garante que o histórico comece sempre com 'user'
+    const rawHistory = Array.isArray(history)
+      ? history
+          .filter((item: any) =>
+            item &&
+            (item.role === 'user' || item.role === 'model') &&
+            Array.isArray(item.parts) &&
+            typeof item.parts[0]?.text === 'string' &&
+            !item.parts[0].text.includes('ocorreu um erro de conexão') &&
+            !item.parts[0].text.includes('ocorreu uma instabilidade')
+          )
+          .map((item: any) => ({
+            role: item.role,
+            parts: [{ text: cleanRawJsonFromText(item.parts[0].text) || '...' }]
+          }))
+      : []
+
+    // A API Gemini exige que a primeira mensagem do history seja role === 'user'
+    while (rawHistory.length > 0 && rawHistory[0].role !== 'user') {
+      rawHistory.shift()
+    }
+
+    const candidates = await getCandidateModels(signal)
+    let lastError: unknown = null
+
+    // Loop de Redundância: se um modelo der 503 (sobrecarga), tenta o próximo automaticamente!
+    for (const modelName of candidates) {
+      try {
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+
+        const model = genAI.getGenerativeModel({
+          model: modelName,
+          systemInstruction: {
+            role: 'system',
+            parts: [{ text: baseSystemInstruction + dynamicContext }]
+          },
+          tools: [{ functionDeclarations }]
+        })
+
+        const chat = model.startChat({ history: rawHistory })
+        const result = await chat.sendMessage(message, { signal, timeout: 30000 })
+        const response = result.response
+
+        const functionCalls = response.functionCalls()
+
+        if (functionCalls && functionCalls.length > 0) {
+          const call = functionCalls[0]
+          let replyText = ''
+          try {
+            replyText = cleanRawJsonFromText(response.text())
+          } catch {
+            replyText = ''
+          }
+
+          try {
+            const followUp = await chat.sendMessage([
+              {
+                functionResponse: {
+                  name: call.name,
+                  response: { status: 'solicitacao_recebida_aguardando_validacao_no_painel', args: call.args }
+                }
+              }
+            ], { signal, timeout: 30000 })
+            replyText = cleanRawJsonFromText(followUp.response.text()) || replyText
+          } catch (error) {
+            if (signal.aborted) throw error
+            // Se o follow-up sofrer oscilação, mantém a confirmação direta
+          }
+
+          return {
+            text: replyText || 'Solicitação recebida. Vou verificar a ação no painel.',
+            action: call.name,
+            actionArgs: { ...call.args, ...((call.args as Record<string, unknown>).ssid_name !== undefined ? { ssidName: (call.args as Record<string, unknown>).ssid_name } : {}) }
+          }
+        }
+
+        const finalText = cleanRawJsonFromText(response.text())
+        return {
+          text: finalText || 'Como posso ajudar com o Code Net?',
+          action: null
+        }
+      } catch (err: any) {
+        if (signal.aborted) throw err
+        lastError = err
+        continue
+      }
+    }
+
+    throw lastError || new Error('Todos os modelos candidatos estão temporariamente indisponíveis.')
+}
+
 function AssistantIcon({ className = "w-7 h-7", style }: { className?: string, style?: React.CSSProperties }) {
   return (
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="currentColor" className={className} style={style}>
@@ -23,7 +246,7 @@ function AssistantIcon({ className = "w-7 h-7", style }: { className?: string, s
 
 function Z7RobotIcon({ className = 'w-9 h-9' }: { className?: string }) {
   const [failed, setFailed] = useState(false)
-  if (!failed) return <img src="/codenet/z7-robo.png" alt="" draggable={false} className={`${className} mix-blend-screen object-contain`} onError={() => setFailed(true)} />
+  if (!failed) return <img src="/codenet-v2/z7-robo.png" alt="" draggable={false} className={`${className} mix-blend-screen object-contain`} onError={() => setFailed(true)} />
   return (
     <svg viewBox="0 0 64 64" fill="none" className={className} aria-hidden="true">
       <path d="M32 15V9" stroke="white" strokeWidth="3" />
@@ -43,7 +266,7 @@ function ZsevenAiIcon({ className = 'w-8 h-8' }: { className?: string }) {
   const [failed, setFailed] = useState(false)
   return failed
     ? <AssistantIcon className={className} />
-    : <img src="/codenet/ia-zseven.png" alt="" draggable={false} style={{ filter: 'brightness(0) saturate(100%) invert(69%) sepia(46%) saturate(1500%) hue-rotate(213deg) brightness(100%) contrast(96%)' }} className={`${className} mix-blend-screen object-contain`} onError={() => setFailed(true)} />
+    : <img src="/codenet-v2/ia-zseven.png" alt="" draggable={false} style={{ filter: 'brightness(0) saturate(100%) invert(69%) sepia(46%) saturate(1500%) hue-rotate(213deg) brightness(100%) contrast(96%)' }} className={`${className} mix-blend-screen object-contain`} onError={() => setFailed(true)} />
 }
 
 function DraggableAiFab({ onOpen, label }: { onOpen: () => void; label: string }) {
@@ -253,7 +476,7 @@ function MobileAiExplainer({ lang, executive = false }: { lang: Language; execut
   const id = useId()
   const l = (pt: string, en: string) => lang === 'pt' ? pt : en
   const titles = executive ? [l('Auditar segurança', 'Audit security'), l('Analisar contratos', 'Analyze contracts'), l('Monitorar operações', 'Monitor operations')] : [l('1. Intenção Inteligente', '1. Smart Intent'), l('2. Estrelinha Pensando (Análise)', '2. Thinking Star (Analysis)'), l('3. Resposta & Proteção', '3. Response & Protection')]
-  const descriptions = executive ? [l('A IA ajuda a interpretar eventos e verificações SHA-256 disponíveis. A autorização deve ser validada pelo servidor; uma explicação não aplica bloqueios.', 'AI helps interpret available events and SHA-256 checks. Authorization belongs on the server; explanations do not apply blocks.'), l('Com o contrato fornecido à base de conhecimento, a IA pode ajudar a comparar cláusulas e SLAs do provedor. Esta demonstração não acessa contratos privados.', 'With contracts supplied to the knowledge base, AI can help compare ISP clauses and SLAs. This demonstration does not access private contracts.'), l('Os eventos recebidos da bancada contextualizam as respostas. Durante uma automação, o envio ao chat fica bloqueado e volta ao concluir ou cancelar.', 'Received bench events provide context. Chat submission locks during automation and unlocks after completion or cancellation.')] : [l('Comandos explícitos, como “abrir relatórios”, direcionam a tela respeitando o perfil. Perguntas seguem para /codenet/api/chat.', 'Explicit commands such as “open reports” navigate within role permissions. Questions go to /codenet/api/chat.'), l('A estrela representa a análise da pergunta com os dados disponibilizados pela sessão e pela base RAG. Este cartão explica o fluxo; não envia uma consulta.', 'The star represents question analysis with available session and RAG data. This card explains the flow; it sends no query.'), l('A resposta orienta o operador. Credenciais sensíveis não devem ser expostas; ações passam pelas validações do sistema. O chat requer conexão e fica bloqueado durante a automação.', 'Responses guide operators. Sensitive credentials must not be exposed; actions pass system validation. Chat requires connectivity and locks during automation.')]
+  const descriptions = executive ? [l('A IA ajuda a interpretar eventos e verificações SHA-256 disponíveis. A autorização deve ser validada pelo servidor; uma explicação não aplica bloqueios.', 'AI helps interpret available events and SHA-256 checks. Authorization belongs on the server; explanations do not apply blocks.'), l('Com o contrato fornecido à base de conhecimento, a IA pode ajudar a comparar cláusulas e SLAs do provedor. Esta demonstração não acessa contratos privados.', 'With contracts supplied to the knowledge base, AI can help compare ISP clauses and SLAs. This demonstration does not access private contracts.'), l('Os eventos recebidos da bancada contextualizam as respostas. Durante uma automação, o envio ao chat fica bloqueado e volta ao concluir ou cancelar.', 'Received bench events provide context. Chat submission locks during automation and unlocks after completion or cancellation.')] : [l('Comandos explícitos, como “abrir relatórios”, direcionam a tela respeitando o perfil. Perguntas seguem diretamente para a API do Gemini.', 'Explicit commands such as “open reports” navigate within role permissions. Questions go directly to the Gemini API.'), l('A estrela representa a análise da pergunta com os dados disponibilizados pela sessão e pela base RAG. Este cartão explica o fluxo; não envia uma consulta.', 'The star represents question analysis with available session and RAG data. This card explains the flow; it sends no query.'), l('A resposta orienta o operador. Credenciais sensíveis não devem ser expostas; ações passam pelas validações do sistema. O chat requer conexão e fica bloqueado durante a automação.', 'Responses guide operators. Sensitive credentials must not be exposed; actions pass system validation. Chat requires connectivity and locks during automation.')]
   return <article className={mobileShowcaseCard}><h3 className="font-bold flex items-center gap-3"><AssistantIcon className="w-8 h-8 shrink-0 text-violet-400 mobile-ai-shimmer drop-shadow-[0_0_12px_rgba(167,139,250,0.95)] motion-safe:animate-pulse" />{executive ? l('Zseven IA Executiva', 'Executive Zseven AI') : l('Como Funciona a Zseven IA', 'How Zseven AI Works')}<ZsevenSparkIcon /></h3><div role="tablist" aria-label={l('Etapas da IA', 'AI stages')} className="grid grid-cols-1 gap-2">{titles.map((title, index) => <button type="button" role="tab" id={`${id}-tab-${index}`} aria-controls={`${id}-panel`} aria-selected={tab === index} key={title} onClick={() => setTab(index)} className={`min-h-11 rounded-xl border px-3 py-2 text-sm text-left ${tab === index ? 'border-violet-500 bg-violet-500/10' : 'border-border'}`}>{title}</button>)}</div><p id={`${id}-panel`} role="tabpanel" aria-labelledby={`${id}-tab-${tab}`} className="text-sm text-muted-foreground leading-relaxed">{descriptions[tab]}</p><style>{`@keyframes mobile-star-shimmer { 0%,100% { filter:brightness(1); opacity:.8 } 50% { filter:brightness(1.9); opacity:1 } } .mobile-ai-shimmer path { animation:mobile-star-shimmer 2.6s ease-in-out infinite } .mobile-ai-shimmer path:nth-child(2) { animation-delay:.7s } @media(prefers-reduced-motion:reduce) { .mobile-ai-shimmer path { animation:none } }`}</style></article>
 }
 function MobileBotShowcase({ lang }: { lang: Language }) {
@@ -3087,7 +3310,7 @@ async function createBatchPdf(batch: ConfigBatch): Promise<Blob> {
       image.onerror = () => { clearTimeout(timeout); resolve(null) }; image.src = src
     })
   }
-  const logos = await Promise.all([logo('/codenet/codenet-logo.png'), logo('/codenet/zseven.jpeg')])
+  const logos = await Promise.all([logo('/codenet-v2/codenet-logo.png'), logo('/codenet-v2/zseven.jpeg')])
   const evidenceImages = new Map<string, { power: Logo | null; serial: Logo | null }>()
   if (batch.mode === 'python') {
     // Bound parallel image loads so a large batch does not open hundreds of HTTP requests at once.
@@ -4062,9 +4285,9 @@ function AppearanceStyle({ themeMode, accentColor }: { themeMode: ThemeMode; acc
     .codenet-ui [class*="text-muted-foreground"] { color:#475569 !important; }
     .codenet-ui [class*="border-border"] { border-color:#cbd5e1 !important; }
     .codenet-ui [class~="bg-violet-600"], .codenet-ui [class~="bg-violet-600"] * { color:#fff !important; }
-    .codenet-ui img[src="/codenet/codenet-logo.png"], .codenet-ui img[src="/codenet/z7-robo.png"], .codenet-ui img[src="/codenet/zseven.jpeg"] { mix-blend-mode:normal !important; filter:invert(1) hue-rotate(180deg); }
+    .codenet-ui img[src="/codenet-v2/codenet-logo.png"], .codenet-ui img[src="/codenet-v2/z7-robo.png"], .codenet-ui img[src="/codenet-v2/zseven.jpeg"] { mix-blend-mode:normal !important; filter:invert(1) hue-rotate(180deg); }
     .codenet-ui .mix-blend-screen { mix-blend-mode:normal !important; }
-    .codenet-ui [class~="bg-violet-600"] img[src="/codenet/z7-robo.png"] { filter:none; }
+    .codenet-ui [class~="bg-violet-600"] img[src="/codenet-v2/z7-robo.png"] { filter:none; }
     .codenet-ui svg[aria-hidden="true"] { isolation:isolate; }
     .codenet-ui input, .codenet-ui select, .codenet-ui textarea { color:#0f172a; background-color:#fff; }
     .codenet-ui [role="dialog"] { color:#0f172a; }
@@ -4080,9 +4303,9 @@ function AppearanceStyle({ themeMode, accentColor }: { themeMode: ThemeMode; acc
     .codenet-ui .lucide { color:#0f172a !important; }
     .codenet-ui [class~="bg-violet-600"] .lucide, .codenet-ui [class~="bg-violet-600"] svg { color:white !important; }
     .codenet-ui aside nav button:not([class~="bg-violet-600"]):not(:hover) { background-color:transparent !important; color:#1e293b !important; }
-    .codenet-ui img[src="/codenet/discord.jpeg"], .codenet-ui img[src="/codenet/youtube.jpeg"] { filter:brightness(0); opacity:.85; }
-    .codenet-ui a:hover img[src="/codenet/discord.jpeg"] { filter:invert(34%) sepia(85%) saturate(3015%) hue-rotate(222deg) brightness(97%) contrast(93%); opacity:1; }
-    .codenet-ui a:hover img[src="/codenet/youtube.jpeg"] { filter:invert(23%) sepia(90%) saturate(6054%) hue-rotate(354deg) brightness(94%) contrast(115%); opacity:1; }
+    .codenet-ui img[src="/codenet-v2/discord.jpeg"], .codenet-ui img[src="/codenet-v2/youtube.jpeg"] { filter:brightness(0); opacity:.85; }
+    .codenet-ui a:hover img[src="/codenet-v2/discord.jpeg"] { filter:invert(34%) sepia(85%) saturate(3015%) hue-rotate(222deg) brightness(97%) contrast(93%); opacity:1; }
+    .codenet-ui a:hover img[src="/codenet-v2/youtube.jpeg"] { filter:invert(23%) sepia(90%) saturate(6054%) hue-rotate(354deg) brightness(94%) contrast(115%); opacity:1; }
     ` : ''}
     @media (prefers-reduced-motion:reduce) { .codenet-ui svg * { transition:none !important; } }
   `}</style>
@@ -4872,23 +5095,14 @@ export default function Page() {
     }))
 
     try {
-      const response = await fetch(window.location.origin + '/codenet/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text, history, systemContext: {
+      const data = await requestGeminiChat(text, history, {
           username, userRole, activeMenu, lang, targetRouterIp, autoProgress, isAutoRunning,
           availableScreens: (userRole === 'user' ? USER_ALLOWED_MENUS : [...ADMIN_ONLY_MENUS, 'diagnostics', 'settings'] as SidebarMenu[]).map(id => ({ id, name: menuNameMap[id] })),
           zteModels: batchModels.map(model => ({ model, ...batchModelFiles(model), firmwareRequired: Boolean(batchModelFiles(model).firmware) })),
           ssid24Name, ssid24Enabled, ssid24Crypto, ssid5Name, ssid5Enabled, ssid5Crypto,
           trAcsUrl, trPeriodicInform, trPeriodicInterval, latestLogs: overviewLogs.slice(0, 3),
           targetRouterModel: preferences.targetRouterModel, preferences, moduleSnapshots
-        } }),
-        signal: controller.signal
-      })
-      if (!response.ok) throw new Error(`Chat API returned HTTP ${response.status}`)
-
-      const data: { text?: unknown; action?: unknown; actionArgs?: { screen?: unknown; diagnostic_tab?: unknown; band?: unknown; ssid?: unknown; name?: unknown; ssidName?: unknown; crypto?: unknown; encryption?: unknown } | null } | null = await response.json()
-      if (!data || typeof data.text !== 'string') throw new Error('Invalid chat API response')
+        }, controller.signal)
 
       // Ignore responses belonging to a closed session or a canceled request.
       if (controller.signal.aborted || chatRequestRef.current !== controller) return
@@ -5045,7 +5259,7 @@ export default function Page() {
               <div className="text-center">
                 <h1 className="text-3xl font-bold tracking-tight text-white">
                   {account && <span className="block text-xl sm:text-2xl">{t.createAccountTitle}</span>}
-                  <button type="button" title="Atualizar página" aria-label={lang === 'pt' ? 'Atualizar página' : 'Reload page'} onClick={() => window.location.reload()} className="block mx-auto cursor-pointer rounded-lg focus-visible:outline focus-visible:outline-violet-400"><img src="/codenet/codenet-logo.png" alt="Code Net" className="h-20 sm:h-24 w-auto object-contain mix-blend-screen mx-auto cursor-pointer" /></button>
+                  <button type="button" title="Atualizar página" aria-label={lang === 'pt' ? 'Atualizar página' : 'Reload page'} onClick={() => window.location.reload()} className="block mx-auto cursor-pointer rounded-lg focus-visible:outline focus-visible:outline-violet-400"><img src="/codenet-v2/codenet-logo.png" alt="Code Net" className="h-20 sm:h-24 w-auto object-contain mix-blend-screen mx-auto cursor-pointer" /></button>
                 </h1>
                 <p className="mt-2 text-sm text-muted-foreground leading-relaxed">
                   {t.loginSubtitle}
@@ -5160,7 +5374,7 @@ export default function Page() {
 
               <div className="flex-1 flex justify-center items-center h-24 overflow-hidden rounded-xl group cursor-pointer">
                 <img 
-                  src="/codenet/LybertyNet.jpeg"
+                  src="/codenet-v2/LybertyNet.jpeg"
                   alt="Logo LybertyNet" 
                   className="w-full h-full object-cover rounded-xl transition-all duration-300 ease-out group-hover:scale-110 group-hover:-translate-y-1.5 group-hover:brightness-110 group-hover:animate-pulse pointer-events-auto select-none shadow-sm"
                 />
@@ -5218,7 +5432,7 @@ export default function Page() {
               <Router size={20} />
             </div>
             <div className="min-w-0 flex justify-center">
-              <button type="button" title="Atualizar página" aria-label={lang === 'pt' ? 'Atualizar página' : 'Reload page'} onClick={() => window.location.reload()} className="block mx-auto cursor-pointer rounded-lg focus-visible:outline focus-visible:outline-violet-400"><img src="/codenet/codenet-logo.png" alt="Code Net" className="h-10 w-auto max-w-full scale-125 object-contain mix-blend-screen mx-auto cursor-pointer" /></button>
+              <button type="button" title="Atualizar página" aria-label={lang === 'pt' ? 'Atualizar página' : 'Reload page'} onClick={() => window.location.reload()} className="block mx-auto cursor-pointer rounded-lg focus-visible:outline focus-visible:outline-violet-400"><img src="/codenet-v2/codenet-logo.png" alt="Code Net" className="h-10 w-auto max-w-full scale-125 object-contain mix-blend-screen mx-auto cursor-pointer" /></button>
             </div>
           <button 
             type="button" 
@@ -6446,7 +6660,7 @@ export default function Page() {
               <div className="flex flex-col sm:flex-row items-center gap-8 md:gap-10">
                 <div className="flex items-center justify-center">
                   <img 
-                    src="/codenet/zseven.jpeg" 
+                    src="/codenet-v2/zseven.jpeg" 
                     alt="Zseven Systems" 
                     className="h-24 w-auto object-contain opacity-100 hover:opacity-125 transition-opacity drop-shadow-md"
                   />
@@ -6484,7 +6698,7 @@ export default function Page() {
                     title={t.discordTitle}
                   >
                     <img 
-                      src="/codenet/discord.jpeg" 
+                      src="/codenet-v2/discord.jpeg" 
                       alt="Discord" 
                       className="w-[37px] h-[37px] object-contain opacity-70 group-hover:opacity-100 group-hover:[filter:invert(34%)_sepia(85%)_saturate(3015%)_hue-rotate(222deg)_brightness(97%)_contrast(93%)] transition-all duration-300"
                     />
@@ -6497,7 +6711,7 @@ export default function Page() {
                     title={t.youtubeTitle}
                   >
                     <img 
-                      src="/codenet/youtube.jpeg" 
+                      src="/codenet-v2/youtube.jpeg" 
                       alt="YouTube" 
                       className="w-[50px] h-[50px] object-contain opacity-70 group-hover:opacity-100 group-hover:[filter:invert(23%)_sepia(90%)_saturate(6054%)_hue-rotate(354deg)_brightness(94%)_contrast(115%)] transition-all duration-300"
                     />
